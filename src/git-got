@@ -37,7 +37,10 @@ import hashlib
 import json
 import fnmatch
 import requests
-import pycurl
+try:
+  import pycurl
+except:
+  pycurl = None
 import dulwich.porcelain
 import errno
 import requests_toolbelt.multipart.encoder
@@ -55,6 +58,7 @@ import urllib
 import shutil
 
 VERSION = 1
+REQUESTS_CHUNK_SIZE = 4096
 
 remote_objs = []
 
@@ -77,6 +81,12 @@ def store_with_cache(fn):
     fn(self, filename, checksum, *args, **kwargs)
     self.store_in_cache(filename, checksum)
   return wrapped
+
+def get_int_from_headers(headers, field):
+  try:
+    return int(headers[field])
+  except:
+    return 0
 
 class Remote(object):
   def __init__(self, configuration):
@@ -321,6 +331,31 @@ class SRR(Remote):
       print_transfer_string(down_current, down_total, self.filename,
                             "Downloading")
 
+  def get_with_pycurl(self, url, filename):
+    with open(filename, 'wb') as f:
+      c = pycurl.Curl()
+      c.setopt(c.URL, url)
+      c.setopt(c.WRITEDATA, f)
+      c.setopt(c.NOPROGRESS, 0)
+      c.setopt(c.PROGRESSFUNCTION, self._curlprogress)
+      c.perform()
+      if c.getinfo(pycurl.HTTP_CODE) == 404:
+        raise Exception("Unexpected result from SRR: %d" % c.getinfo(pycurl.HTTP_CODE))
+      c.close()
+
+  def get_with_requests(self, url, filename):
+    total_length = 0
+    count = 0
+    r = requests.get(url, stream=True)
+    with open(filename, 'wb') as f:
+        total_length = get_int_from_headers(r.headers, 'Content-Length')
+        for chunk in r.iter_content(chunk_size=REQUESTS_CHUNK_SIZE):
+            if chunk: # filter out keep-alive new chunks
+                count = count+len(chunk)
+                f.write(chunk)
+                print_transfer_string(count, total_length, filename, 'Downloading')
+        f.close()
+
   @load_with_cache
   def load(self, filename, checksum):
     checksum = checksum.encode('utf-8')
@@ -329,21 +364,15 @@ class SRR(Remote):
     server = server.encode('utf-8')
     parent_id = parent_id.encode('utf-8')
 
-    path = self._get_remote_path_srr(server, checksum)
-    logging.debug("load_srr, filename %s, path %s" % (filename, path))
+    url = self._get_remote_path_srr(server, checksum)
+    logging.debug("load_srr, filename %s, url %s" % (filename, url))
 
     self.last_mb = -1
     self.filename = filename
-    with open(filename, 'wb') as f:
-      c = pycurl.Curl()
-      c.setopt(c.URL, path)
-      c.setopt(c.WRITEDATA, f)
-      c.setopt(c.NOPROGRESS, 0)
-      c.setopt(c.PROGRESSFUNCTION, self._curlprogress)
-      c.perform()
-      if c.getinfo(pycurl.HTTP_CODE) == 404:
-        raise Exception("Unexpected result from SRR: %d" % c.getinfo(pycurl.HTTP_CODE))
-      c.close()
+    if pycurl:
+      self.get_with_pycurl(url, filename)
+    else:
+      self.get_with_requests(url, filename)
 
     sys.stdout.write("\n")
 
